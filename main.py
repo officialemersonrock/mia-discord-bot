@@ -887,6 +887,9 @@ async def run_primary_model(
                 max_output_tokens=80,
                 thinking_config=types.ThinkingConfig(
                     thinking_level="minimal"
+                ),
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                    disable=True
                 )
             )
         ),
@@ -911,6 +914,9 @@ async def run_backup_model(
                 max_output_tokens=80,
                 thinking_config=types.ThinkingConfig(
                     thinking_level="minimal"
+                ),
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                    disable=True
                 )
             )
         ),
