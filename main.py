@@ -67,6 +67,13 @@ recent_members = defaultdict(
 
 
 # ==========================================
+# ACTIVE MESSAGE TASKS
+# ==========================================
+
+active_message_tasks = set()
+
+
+# ==========================================
 # MIA PERSONALITY
 # ==========================================
 
@@ -387,6 +394,14 @@ When a normal standalone message is sent:
 
 If several members are talking,
 Mia should understand which person said each message.
+
+IMPORTANT FOR FAST CHAT:
+- Multiple messages may arrive while Mia is still thinking.
+- The message Mia is responding to may no longer be the newest message.
+- Always answer the specific NEW MESSAGE shown in the prompt.
+- Use the recent conversation only as context.
+- Do not accidentally answer a newer message instead.
+- Discord will show which exact message Mia replied to.
 
 Mia can react to images naturally when an image is provided.
 
@@ -736,26 +751,29 @@ Server:
 Channel:
 {channel_name}
 
-The person currently talking is:
+The person Mia is responding to is:
 {member_name}
 
 RECENT CONVERSATION:
 {history_text if history_text else "(No recent conversation yet.)"}
 
-NEW MESSAGE FROM {member_name}:
-{message_text}
+SPECIFIC MESSAGE MIA IS RESPONDING TO:
 
-Respond as Mia.
+{member_name}: {message_text}
+
+Respond as Mia to THAT SPECIFIC MESSAGE.
 
 Remember:
 - Your name is Mia.
 - Stay in Mia's little-girl personality.
 - This message does NOT need to mention Mia for you to respond.
 - Normal standalone messages can be answered.
-- Read the recent conversation before answering.
+- The channel may have newer messages by the time you finish.
+- Do not switch to answering a newer message.
+- Answer the specific message shown above.
+- Use recent conversation only to understand context.
 - Pay attention to which member said each message.
 - Understand conversations between multiple members.
-- Do not act like every previous message was directed at Mia.
 - Keep responses short, simple, playful, and natural.
 - Do not constantly talk about wanting a mommy or being adopted.
 - Only bring family/adoption stuff up when it fits.
@@ -893,29 +911,139 @@ async def send_mia_message(
     )
 
     try:
-        if (
-            await is_reply_to_mia(
-                message
-            )
-            or is_mia_mentioned(
-                message
-            )
-        ):
-            await message.reply(
-                reply,
-                mention_author=False,
-                allowed_mentions=allowed_mentions
-            )
+        # Mia uses Discord Reply so everyone can
+        # see exactly which message she answered.
+        await message.reply(
+            reply,
+            mention_author=False,
+            allowed_mentions=allowed_mentions
+        )
 
-        else:
+    except discord.NotFound:
+        # If the original message was deleted before
+        # Mia finished, send normally instead.
+        try:
             await message.channel.send(
                 reply,
                 allowed_mentions=allowed_mentions
             )
 
+        except Exception as error:
+            print(
+                f"Failed to send Mia fallback reply: "
+                f"{error}",
+                flush=True
+            )
+
     except Exception as error:
         print(
             f"Failed to send Mia reply: "
+            f"{error}",
+            flush=True
+        )
+
+
+# ==========================================
+# PROCESS ONE MESSAGE
+# ==========================================
+
+async def process_mia_message(message):
+    try:
+        should_reply = await should_mia_reply(
+            message
+        )
+
+        key = get_memory_key(
+            message
+        )
+
+        member_name = get_display_name(
+            message
+        )
+
+        message_text = clean_message_text(
+            message
+        )
+
+        memory_text = (
+            message_text
+            if message_text
+            else "[sent an image]"
+        )
+
+        conversation_history[key].append(
+            f"{member_name}: {memory_text}"
+        )
+
+        if not should_reply:
+            return
+
+        await maybe_react(
+            message
+        )
+
+        image_data = None
+
+        attachment = (
+            get_image_attachment(
+                message
+            )
+        )
+
+        if attachment is not None:
+            image_data = (
+                await get_attachment_image_data(
+                    attachment
+                )
+            )
+
+        if image_data is None:
+            embed_image_url = (
+                get_embed_image_url(
+                    message
+                )
+            )
+
+            if embed_image_url:
+                try:
+                    image_data = (
+                        await download_embed_image(
+                            embed_image_url
+                        )
+                    )
+
+                except Exception as error:
+                    print(
+                        f"Embed image failed: "
+                        f"{error}",
+                        flush=True
+                    )
+
+        # No typing indicator here.
+        # Mia can process several messages at once.
+        reply = await generate_mia_reply(
+            message,
+            image_data=image_data
+        )
+
+        if not reply:
+            return
+
+        if reply.strip() == "[[NO_REPLY]]":
+            return
+
+        await send_mia_message(
+            message,
+            reply
+        )
+
+        conversation_history[key].append(
+            f"Mia replying to {member_name}: {reply}"
+        )
+
+    except Exception as error:
+        print(
+            f"Mia message processing failed: "
             f"{error}",
             flush=True
         )
@@ -941,100 +1069,35 @@ async def on_message(message):
     if message.webhook_id is not None:
         return
 
-    # Mia works in any server she is invited to.
-    # DMs also work.
+    # ==========================================
+    # PROCESS EACH MESSAGE SEPARATELY
+    # ==========================================
     #
-    # Mia does NOT need to be mentioned.
-    # Normal standalone messages can also receive replies.
-    should_reply = await should_mia_reply(
-        message
-    )
+    # This lets Mia keep working on an older
+    # message while newer messages are arriving.
+    #
+    # Example:
+    #
+    # Person A: im eating pizza
+    # Person B: hi
+    # Person C: anyone wanna play
+    #
+    # Mia can still reply directly to Person A's
+    # pizza message even after B and C have talked.
+    #
 
-    key = get_memory_key(
-        message
-    )
-
-    member_name = get_display_name(
-        message
-    )
-
-    message_text = clean_message_text(
-        message
-    )
-
-    memory_text = (
-        message_text
-        if message_text
-        else "[sent an image]"
-    )
-
-    conversation_history[key].append(
-        f"{member_name}: {memory_text}"
-    )
-
-    if not should_reply:
-        return
-
-    await maybe_react(
-        message
-    )
-
-    image_data = None
-
-    attachment = (
-        get_image_attachment(
+    task = asyncio.create_task(
+        process_mia_message(
             message
         )
     )
 
-    if attachment is not None:
-        image_data = (
-            await get_attachment_image_data(
-                attachment
-            )
-        )
-
-    if image_data is None:
-        embed_image_url = (
-            get_embed_image_url(
-                message
-            )
-        )
-
-        if embed_image_url:
-            try:
-                image_data = (
-                    await download_embed_image(
-                        embed_image_url
-                    )
-                )
-
-            except Exception as error:
-                print(
-                    f"Embed image failed: "
-                    f"{error}",
-                    flush=True
-                )
-
-    async with message.channel.typing():
-        reply = await generate_mia_reply(
-            message,
-            image_data=image_data
-        )
-
-    if not reply:
-        return
-
-    if reply.strip() == "[[NO_REPLY]]":
-        return
-
-    await send_mia_message(
-        message,
-        reply
+    active_message_tasks.add(
+        task
     )
 
-    conversation_history[key].append(
-        f"Mia: {reply}"
+    task.add_done_callback(
+        active_message_tasks.discard
     )
 
 
@@ -1103,6 +1166,18 @@ async def on_ready():
     print(
         "Mia can respond to normal messages "
         "without needing to be mentioned.",
+        flush=True
+    )
+
+    print(
+        "Mia can process multiple messages "
+        "at the same time.",
+        flush=True
+    )
+
+    print(
+        "Mia uses Discord Reply so people "
+        "can see which message she answered.",
         flush=True
     )
 
