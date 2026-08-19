@@ -2,6 +2,7 @@ import os
 import random
 import asyncio
 import urllib.request
+import time
 from collections import defaultdict, deque
 
 import discord
@@ -26,8 +27,11 @@ BACKUP_MODEL = "gemini-3.5-flash"
 
 HISTORY_LIMIT = 20
 
-NORMAL_REPLY_CHANCE = 1.00
-BUSY_CHAT_REPLY_CHANCE = 1.00
+# Mia does NOT need to answer every normal message.
+# This saves a lot of Gemini requests.
+NORMAL_REPLY_CHANCE = 0.35
+BUSY_CHAT_REPLY_CHANCE = 0.55
+
 REACTION_CHANCE = 0.12
 
 MAX_IMAGE_SIZE = 10 * 1024 * 1024
@@ -40,11 +44,19 @@ SUPPORTED_IMAGE_TYPES = {
 }
 
 # Mia can process several messages at once.
-MAX_CONCURRENT_AI_REQUESTS = 5
+MAX_CONCURRENT_AI_REQUESTS = 3
 
 # Don't let one Gemini request keep Mia waiting forever.
 PRIMARY_TIMEOUT_SECONDS = 8
 BACKUP_TIMEOUT_SECONDS = 6
+
+# For normal messages, Mia will not keep making
+# unsolicited AI replies every second in one channel.
+NORMAL_CHANNEL_REPLY_COOLDOWN = 8
+
+# If Gemini says quota/rate limit is exhausted,
+# stop hammering the API for a while.
+QUOTA_BACKOFF_SECONDS = 60
 
 
 # ==========================================
@@ -87,6 +99,22 @@ active_message_tasks = set()
 ai_request_semaphore = asyncio.Semaphore(
     MAX_CONCURRENT_AI_REQUESTS
 )
+
+
+# ==========================================
+# NORMAL CHANNEL REPLY COOLDOWNS
+# ==========================================
+
+last_normal_reply_time = defaultdict(
+    float
+)
+
+
+# ==========================================
+# GEMINI QUOTA BACKOFF
+# ==========================================
+
+gemini_quota_blocked_until = 0.0
 
 
 # ==========================================
@@ -597,6 +625,16 @@ async def get_attachment_image_data(
         return None
 
 
+def is_quota_error(error):
+    error_text = str(error).lower()
+
+    return (
+        "429" in error_text
+        or "resource_exhausted" in error_text
+        or "quota" in error_text
+    )
+
+
 # ==========================================
 # CHECK IF MESSAGE IS DIRECTED AT MIA
 # ==========================================
@@ -648,6 +686,28 @@ def is_mia_mentioned(message):
     return client.user in message.mentions
 
 
+def says_mia_name(message):
+    text = clean_message_text(
+        message
+    ).lower()
+
+    words = text.replace(
+        ",",
+        " "
+    ).replace(
+        ".",
+        " "
+    ).replace(
+        "!",
+        " "
+    ).replace(
+        "?",
+        " "
+    ).split()
+
+    return "mia" in words
+
+
 # ==========================================
 # SHOULD MIA RESPOND
 # ==========================================
@@ -670,7 +730,7 @@ async def should_mia_reply(message):
     )
 
     if not text and not image_attachment and not embed_image:
-        return False
+        return False, False
 
     if text.startswith(
         (
@@ -679,13 +739,24 @@ async def should_mia_reply(message):
             "."
         )
     ):
-        return False
+        return False, False
+
+    # ==========================================
+    # DIRECT MESSAGES TO MIA
+    # ==========================================
 
     if await is_reply_to_mia(message):
-        return True
+        return True, True
 
     if is_mia_mentioned(message):
-        return True
+        return True, True
+
+    if says_mia_name(message):
+        return True, True
+
+    # ==========================================
+    # NORMAL CONVERSATION
+    # ==========================================
 
     key = get_memory_key(
         message
@@ -706,10 +777,12 @@ async def should_mia_reply(message):
     if unique_members >= 3:
         reply_chance = BUSY_CHAT_REPLY_CHANCE
 
-    return (
+    should_reply = (
         random.random()
         < reply_chance
     )
+
+    return should_reply, False
 
 
 # ==========================================
@@ -855,6 +928,13 @@ async def generate_mia_reply(
     message,
     image_data=None
 ):
+    global gemini_quota_blocked_until
+
+    current_time = time.time()
+
+    if current_time < gemini_quota_blocked_until:
+        return None
+
     prompt = build_prompt(
         message
     )
@@ -892,12 +972,34 @@ async def generate_mia_reply(
         )
 
     except Exception as error:
+        if is_quota_error(
+            error
+        ):
+            gemini_quota_blocked_until = (
+                time.time()
+                + QUOTA_BACKOFF_SECONDS
+            )
+
+            print(
+                "Gemini quota is exhausted. "
+                "Mia is pausing AI requests "
+                f"for {QUOTA_BACKOFF_SECONDS} seconds.",
+                flush=True
+            )
+
+            # Do NOT try the backup model when this
+            # is a quota error. It would just waste
+            # another request against the same project.
+            return None
+
         print(
             f"Primary Gemini model failed: "
             f"{error}",
             flush=True
         )
 
+    # Only use backup for a normal model error/timeout,
+    # not for quota exhaustion.
     try:
         reply = await run_backup_model(
             contents
@@ -913,6 +1015,23 @@ async def generate_mia_reply(
         )
 
     except Exception as error:
+        if is_quota_error(
+            error
+        ):
+            gemini_quota_blocked_until = (
+                time.time()
+                + QUOTA_BACKOFF_SECONDS
+            )
+
+            print(
+                "Gemini quota is exhausted. "
+                "Mia is pausing AI requests "
+                f"for {QUOTA_BACKOFF_SECONDS} seconds.",
+                flush=True
+            )
+
+            return None
+
         print(
             f"Backup Gemini model failed: "
             f"{error}",
@@ -1012,8 +1131,10 @@ async def send_mia_message(
 
 async def process_mia_message(message):
     try:
-        should_reply = await should_mia_reply(
-            message
+        should_reply, direct_to_mia = (
+            await should_mia_reply(
+                message
+            )
         )
 
         key = get_memory_key(
@@ -1034,11 +1155,41 @@ async def process_mia_message(message):
             else "[sent an image]"
         )
 
+        # Mia remembers messages even when
+        # she does not respond to them.
         conversation_history[key].append(
             f"{member_name}: {memory_text}"
         )
 
         if not should_reply:
+            return
+
+        current_time = time.time()
+
+        # ==========================================
+        # NORMAL MESSAGE COOLDOWN
+        # ==========================================
+        #
+        # Direct mentions/replies/name calls
+        # bypass this cooldown.
+        #
+
+        if not direct_to_mia:
+            if (
+                current_time
+                - last_normal_reply_time[key]
+                < NORMAL_CHANNEL_REPLY_COOLDOWN
+            ):
+                return
+
+        # ==========================================
+        # QUOTA BACKOFF
+        # ==========================================
+
+        if (
+            current_time
+            < gemini_quota_blocked_until
+        ):
             return
 
         await maybe_react(
@@ -1083,12 +1234,20 @@ async def process_mia_message(message):
                     )
 
         # ==========================================
-        # WAIT FOR A REAL AI SLOT FIRST
+        # WAIT FOR A REAL AI SLOT
         # ==========================================
 
         async with ai_request_semaphore:
 
-            # Correct discord.py typing indicator.
+            # Check quota backoff again because
+            # another request may have hit 429
+            # while this one was waiting.
+            if (
+                time.time()
+                < gemini_quota_blocked_until
+            ):
+                return
+
             async with message.channel.typing():
                 reply = await generate_mia_reply(
                     message,
@@ -1109,6 +1268,13 @@ async def process_mia_message(message):
         conversation_history[key].append(
             f"Mia replying to {member_name}: {reply}"
         )
+
+        # Only start the normal cooldown after
+        # Mia actually sends an unsolicited reply.
+        if not direct_to_mia:
+            last_normal_reply_time[key] = (
+                time.time()
+            )
 
     except Exception as error:
         print(
@@ -1142,13 +1308,8 @@ async def on_message(message):
     # PROCESS EVERY MESSAGE SEPARATELY
     # ==========================================
     #
-    # Person A can send something.
-    # Person B can send something after.
-    # Person C can send something after that.
-    #
-    # Mia can still finish Person A's response
-    # and Discord Reply directly to Person A's
-    # older message.
+    # Mia can still remember fast-moving chat
+    # and respond directly to an older message.
     #
 
     task = asyncio.create_task(
@@ -1229,8 +1390,14 @@ async def on_ready():
     )
 
     print(
-        "Mia can respond to normal messages "
-        "without needing to be mentioned.",
+        "Mia always tries to respond when "
+        "someone directly talks to her.",
+        flush=True
+    )
+
+    print(
+        "Mia sometimes joins normal "
+        "conversations on her own.",
         flush=True
     )
 
@@ -1247,8 +1414,8 @@ async def on_ready():
     )
 
     print(
-        "Mia shows as typing while "
-        "generating her response.",
+        "Mia automatically backs off when "
+        "Gemini reports a quota limit.",
         flush=True
     )
 
