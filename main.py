@@ -39,11 +39,12 @@ SUPPORTED_IMAGE_TYPES = {
     "image/gif"
 }
 
-# Maximum amount of time Mia will wait for one model.
-MODEL_TIMEOUT_SECONDS = 12
+# Mia can process several messages at once.
+MAX_CONCURRENT_AI_REQUESTS = 5
 
-# Don't let hundreds of Gemini requests run at once.
-MAX_CONCURRENT_AI_REQUESTS = 4
+# Don't let one Gemini request keep Mia waiting forever.
+PRIMARY_TIMEOUT_SECONDS = 8
+BACKUP_TIMEOUT_SECONDS = 6
 
 
 # ==========================================
@@ -80,7 +81,7 @@ active_message_tasks = set()
 
 
 # ==========================================
-# LIMIT SIMULTANEOUS AI REQUESTS
+# AI REQUEST LIMIT
 # ==========================================
 
 ai_request_semaphore = asyncio.Semaphore(
@@ -413,8 +414,8 @@ Mia should understand which person said each message.
 IMPORTANT FOR FAST CHAT:
 - Multiple messages may arrive while Mia is still thinking.
 - The message Mia is responding to may no longer be the newest message.
-- Always answer the specific NEW MESSAGE shown in the prompt.
-- Use the recent conversation only as context.
+- Always answer the specific message shown in the prompt.
+- Use recent conversation only as context.
 - Do not accidentally answer a newer message instead.
 - Discord will show which exact message Mia replied to.
 
@@ -799,33 +800,51 @@ Remember:
 
 
 # ==========================================
-# RUN ONE GEMINI MODEL
+# RUN PRIMARY GEMINI MODEL
 # ==========================================
 
-async def run_gemini_model(
-    model,
+async def run_primary_model(
     contents
 ):
-    def generate():
-        response = gemini.models.generate_content(
-            model=model,
+    response = await asyncio.wait_for(
+        gemini.aio.models.generate_content(
+            model=PRIMARY_MODEL,
             contents=contents,
             config=types.GenerateContentConfig(
-                max_output_tokens=100,
+                max_output_tokens=80,
                 thinking_config=types.ThinkingConfig(
                     thinking_level="minimal"
                 )
             )
-        )
-
-        return response.text
-
-    return await asyncio.wait_for(
-        asyncio.to_thread(
-            generate
         ),
-        timeout=MODEL_TIMEOUT_SECONDS
+        timeout=PRIMARY_TIMEOUT_SECONDS
     )
+
+    return response.text
+
+
+# ==========================================
+# RUN BACKUP GEMINI MODEL
+# ==========================================
+
+async def run_backup_model(
+    contents
+):
+    response = await asyncio.wait_for(
+        gemini.aio.models.generate_content(
+            model=BACKUP_MODEL,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                max_output_tokens=80,
+                thinking_config=types.ThinkingConfig(
+                    thinking_level="minimal"
+                )
+            )
+        ),
+        timeout=BACKUP_TIMEOUT_SECONDS
+    )
+
+    return response.text
 
 
 # ==========================================
@@ -858,50 +877,47 @@ async def generate_mia_reply(
             )
         )
 
-    async with ai_request_semaphore:
-        try:
-            reply = await run_gemini_model(
-                PRIMARY_MODEL,
-                contents
-            )
+    try:
+        reply = await run_primary_model(
+            contents
+        )
 
-            if reply:
-                return reply.strip()
+        if reply:
+            return reply.strip()
 
-        except asyncio.TimeoutError:
-            print(
-                "Primary Gemini model timed out.",
-                flush=True
-            )
+    except asyncio.TimeoutError:
+        print(
+            "Primary Gemini model timed out.",
+            flush=True
+        )
 
-        except Exception as error:
-            print(
-                f"Primary Gemini model failed: "
-                f"{error}",
-                flush=True
-            )
+    except Exception as error:
+        print(
+            f"Primary Gemini model failed: "
+            f"{error}",
+            flush=True
+        )
 
-        try:
-            reply = await run_gemini_model(
-                BACKUP_MODEL,
-                contents
-            )
+    try:
+        reply = await run_backup_model(
+            contents
+        )
 
-            if reply:
-                return reply.strip()
+        if reply:
+            return reply.strip()
 
-        except asyncio.TimeoutError:
-            print(
-                "Backup Gemini model timed out.",
-                flush=True
-            )
+    except asyncio.TimeoutError:
+        print(
+            "Backup Gemini model timed out.",
+            flush=True
+        )
 
-        except Exception as error:
-            print(
-                f"Backup Gemini model failed: "
-                f"{error}",
-                flush=True
-            )
+    except Exception as error:
+        print(
+            f"Backup Gemini model failed: "
+            f"{error}",
+            flush=True
+        )
 
     return None
 
@@ -958,8 +974,8 @@ async def send_mia_message(
     )
 
     try:
-        # Mia replies directly to the exact message
-        # she was responding to.
+        # Mia Discord-replies directly to the
+        # exact message she was answering.
         await message.reply(
             reply,
             mention_author=False,
@@ -967,6 +983,8 @@ async def send_mia_message(
         )
 
     except discord.NotFound:
+        # If that old message was deleted while
+        # Mia was thinking, send normally instead.
         try:
             await message.channel.send(
                 reply,
@@ -1064,20 +1082,32 @@ async def process_mia_message(message):
                         flush=True
                     )
 
-        # Show one typing event.
-        # We DO NOT keep a typing context open forever.
-        try:
-            await message.channel.trigger_typing()
-        except (
-            discord.Forbidden,
-            discord.HTTPException
-        ):
-            pass
+        # ==========================================
+        # WAIT FOR A REAL AI SLOT FIRST
+        # ==========================================
+        #
+        # Mia does NOT show typing while she is
+        # waiting behind other messages.
+        #
+        # Once she actually gets a Gemini slot,
+        # THEN Discord shows Mia as typing.
+        #
 
-        reply = await generate_mia_reply(
-            message,
-            image_data=image_data
-        )
+        async with ai_request_semaphore:
+
+            try:
+                await message.channel.trigger_typing()
+
+            except (
+                discord.Forbidden,
+                discord.HTTPException
+            ):
+                pass
+
+            reply = await generate_mia_reply(
+                message,
+                image_data=image_data
+            )
 
         if not reply:
             return
@@ -1122,10 +1152,19 @@ async def on_message(message):
     if message.webhook_id is not None:
         return
 
-    # Each Discord message gets its own task.
+    # ==========================================
+    # PROCESS EVERY MESSAGE SEPARATELY
+    # ==========================================
     #
-    # Mia can still answer an older message
-    # even if newer messages are being sent.
+    # Person A can send something.
+    # Person B can send something after.
+    # Person C can send something after that.
+    #
+    # Mia can still finish Person A's response
+    # and Discord Reply directly to Person A's
+    # older message.
+    #
+
     task = asyncio.create_task(
         process_mia_message(
             message
@@ -1222,8 +1261,14 @@ async def on_ready():
     )
 
     print(
-        "Mia is using the low-latency "
-        "Gemini Flash-Lite model.",
+        "Mia only shows typing after her "
+        "message actually starts processing.",
+        flush=True
+    )
+
+    print(
+        "Mia is using Google's native "
+        "async Gemini API.",
         flush=True
     )
 
