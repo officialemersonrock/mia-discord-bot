@@ -1085,29 +1085,15 @@ async def process_mia_message(message):
         # ==========================================
         # WAIT FOR A REAL AI SLOT FIRST
         # ==========================================
-        #
-        # Mia does NOT show typing while she is
-        # waiting behind other messages.
-        #
-        # Once she actually gets a Gemini slot,
-        # THEN Discord shows Mia as typing.
-        #
 
         async with ai_request_semaphore:
 
-            try:
-                await message.channel.trigger_typing()
-
-            except (
-                discord.Forbidden,
-                discord.HTTPException
-            ):
-                pass
-
-            reply = await generate_mia_reply(
-                message,
-                image_data=image_data
-            )
+            # Correct discord.py typing indicator.
+            async with message.channel.typing():
+                reply = await generate_mia_reply(
+                    message,
+                    image_data=image_data
+                )
 
         if not reply:
             return
@@ -1261,14 +1247,8 @@ async def on_ready():
     )
 
     print(
-        "Mia only shows typing after her "
-        "message actually starts processing.",
-        flush=True
-    )
-
-    print(
-        "Mia is using Google's native "
-        "async Gemini API.",
+        "Mia shows as typing while "
+        "generating her response.",
         flush=True
     )
 
