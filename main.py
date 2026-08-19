@@ -1019,12 +1019,15 @@ async def process_mia_message(message):
                         flush=True
                     )
 
-        # No typing indicator here.
-        # Mia can process several messages at once.
-        reply = await generate_mia_reply(
-            message,
-            image_data=image_data
-        )
+        # ==========================================
+        # SHOW MIA AS TYPING WHILE SHE THINKS
+        # ==========================================
+
+        async with message.channel.typing():
+            reply = await generate_mia_reply(
+                message,
+                image_data=image_data
+            )
 
         if not reply:
             return
@@ -1073,17 +1076,10 @@ async def on_message(message):
     # PROCESS EACH MESSAGE SEPARATELY
     # ==========================================
     #
-    # This lets Mia keep working on an older
-    # message while newer messages are arriving.
+    # Mia can still work on an older message
+    # while newer messages are coming in.
     #
-    # Example:
-    #
-    # Person A: im eating pizza
-    # Person B: hi
-    # Person C: anyone wanna play
-    #
-    # Mia can still reply directly to Person A's
-    # pizza message even after B and C have talked.
+    # Each message gets its own task.
     #
 
     task = asyncio.create_task(
@@ -1178,6 +1174,12 @@ async def on_ready():
     print(
         "Mia uses Discord Reply so people "
         "can see which message she answered.",
+        flush=True
+    )
+
+    print(
+        "Mia shows as typing while "
+        "generating her replies.",
         flush=True
     )
 
