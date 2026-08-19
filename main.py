@@ -21,8 +21,8 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 # SETTINGS
 # ==========================================
 
-PRIMARY_MODEL = "gemini-3.5-flash"
-BACKUP_MODEL = "gemini-2.5-flash"
+PRIMARY_MODEL = "gemini-3.5-flash-lite"
+BACKUP_MODEL = "gemini-3.5-flash"
 
 HISTORY_LIMIT = 20
 
@@ -38,6 +38,12 @@ SUPPORTED_IMAGE_TYPES = {
     "image/webp",
     "image/gif"
 }
+
+# Maximum amount of time Mia will wait for one model.
+MODEL_TIMEOUT_SECONDS = 12
+
+# Don't let hundreds of Gemini requests run at once.
+MAX_CONCURRENT_AI_REQUESTS = 4
 
 
 # ==========================================
@@ -71,6 +77,15 @@ recent_members = defaultdict(
 # ==========================================
 
 active_message_tasks = set()
+
+
+# ==========================================
+# LIMIT SIMULTANEOUS AI REQUESTS
+# ==========================================
+
+ai_request_semaphore = asyncio.Semaphore(
+    MAX_CONCURRENT_AI_REQUESTS
+)
 
 
 # ==========================================
@@ -527,7 +542,7 @@ async def download_embed_image(url):
 
         with urllib.request.urlopen(
             request,
-            timeout=15
+            timeout=10
         ) as response:
             content_type = (
                 response.headers.get(
@@ -766,24 +781,51 @@ Respond as Mia to THAT SPECIFIC MESSAGE.
 Remember:
 - Your name is Mia.
 - Stay in Mia's little-girl personality.
-- This message does NOT need to mention Mia for you to respond.
-- Normal standalone messages can be answered.
 - The channel may have newer messages by the time you finish.
 - Do not switch to answering a newer message.
 - Answer the specific message shown above.
-- Use recent conversation only to understand context.
-- Pay attention to which member said each message.
-- Understand conversations between multiple members.
-- Keep responses short, simple, playful, and natural.
+- Use recent conversation only for context.
+- Keep the answer VERY SHORT.
+- Usually use 1 short sentence.
+- At most use 2 short sentences.
 - Do not constantly talk about wanting a mommy or being adopted.
 - Only bring family/adoption stuff up when it fits.
 - Avoid repeating yourself.
 - If there is genuinely nothing natural to say,
   output exactly [[NO_REPLY]].
-- Do not overuse [[NO_REPLY]] because Mia is social.
 """
 
     return prompt
+
+
+# ==========================================
+# RUN ONE GEMINI MODEL
+# ==========================================
+
+async def run_gemini_model(
+    model,
+    contents
+):
+    def generate():
+        response = gemini.models.generate_content(
+            model=model,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                max_output_tokens=100,
+                thinking_config=types.ThinkingConfig(
+                    thinking_level="minimal"
+                )
+            )
+        )
+
+        return response.text
+
+    return await asyncio.wait_for(
+        asyncio.to_thread(
+            generate
+        ),
+        timeout=MODEL_TIMEOUT_SECONDS
+    )
 
 
 # ==========================================
@@ -816,45 +858,50 @@ async def generate_mia_reply(
             )
         )
 
-    def generate(model):
-        response = gemini.models.generate_content(
-            model=model,
-            contents=contents
-        )
+    async with ai_request_semaphore:
+        try:
+            reply = await run_gemini_model(
+                PRIMARY_MODEL,
+                contents
+            )
 
-        return response.text
+            if reply:
+                return reply.strip()
 
-    try:
-        reply = await asyncio.to_thread(
-            generate,
-            PRIMARY_MODEL
-        )
+        except asyncio.TimeoutError:
+            print(
+                "Primary Gemini model timed out.",
+                flush=True
+            )
 
-        if reply:
-            return reply.strip()
+        except Exception as error:
+            print(
+                f"Primary Gemini model failed: "
+                f"{error}",
+                flush=True
+            )
 
-    except Exception as error:
-        print(
-            f"Primary Gemini model failed: "
-            f"{error}",
-            flush=True
-        )
+        try:
+            reply = await run_gemini_model(
+                BACKUP_MODEL,
+                contents
+            )
 
-    try:
-        reply = await asyncio.to_thread(
-            generate,
-            BACKUP_MODEL
-        )
+            if reply:
+                return reply.strip()
 
-        if reply:
-            return reply.strip()
+        except asyncio.TimeoutError:
+            print(
+                "Backup Gemini model timed out.",
+                flush=True
+            )
 
-    except Exception as error:
-        print(
-            f"Backup Gemini model failed: "
-            f"{error}",
-            flush=True
-        )
+        except Exception as error:
+            print(
+                f"Backup Gemini model failed: "
+                f"{error}",
+                flush=True
+            )
 
     return None
 
@@ -911,8 +958,8 @@ async def send_mia_message(
     )
 
     try:
-        # Mia uses Discord Reply so everyone can
-        # see exactly which message she answered.
+        # Mia replies directly to the exact message
+        # she was responding to.
         await message.reply(
             reply,
             mention_author=False,
@@ -920,8 +967,6 @@ async def send_mia_message(
         )
 
     except discord.NotFound:
-        # If the original message was deleted before
-        # Mia finished, send normally instead.
         try:
             await message.channel.send(
                 reply,
@@ -1019,15 +1064,20 @@ async def process_mia_message(message):
                         flush=True
                     )
 
-        # ==========================================
-        # SHOW MIA AS TYPING WHILE SHE THINKS
-        # ==========================================
+        # Show one typing event.
+        # We DO NOT keep a typing context open forever.
+        try:
+            await message.channel.trigger_typing()
+        except (
+            discord.Forbidden,
+            discord.HTTPException
+        ):
+            pass
 
-        async with message.channel.typing():
-            reply = await generate_mia_reply(
-                message,
-                image_data=image_data
-            )
+        reply = await generate_mia_reply(
+            message,
+            image_data=image_data
+        )
 
         if not reply:
             return
@@ -1072,16 +1122,10 @@ async def on_message(message):
     if message.webhook_id is not None:
         return
 
-    # ==========================================
-    # PROCESS EACH MESSAGE SEPARATELY
-    # ==========================================
+    # Each Discord message gets its own task.
     #
-    # Mia can still work on an older message
-    # while newer messages are coming in.
-    #
-    # Each message gets its own task.
-    #
-
+    # Mia can still answer an older message
+    # even if newer messages are being sent.
     task = asyncio.create_task(
         process_mia_message(
             message
@@ -1178,8 +1222,8 @@ async def on_ready():
     )
 
     print(
-        "Mia shows as typing while "
-        "generating her replies.",
+        "Mia is using the low-latency "
+        "Gemini Flash-Lite model.",
         flush=True
     )
 
