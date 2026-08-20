@@ -3,6 +3,9 @@ import random
 import asyncio
 import urllib.request
 import time
+import json
+import base64
+import requests
 from collections import defaultdict, deque
 
 import discord
@@ -17,6 +20,13 @@ from google.genai import types
 DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
+# Third fallback after both Gemini models fail.
+# Add OPENROUTER_API_KEY in Railway Variables.
+OPENROUTER_API_KEY = os.environ.get(
+    "OPENROUTER_API_KEY",
+    ""
+).strip()
+
 
 # ==========================================
 # SETTINGS
@@ -24,6 +34,12 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 PRIMARY_MODEL = "gemini-3.5-flash-lite"
 BACKUP_MODEL = "gemini-3.5-flash"
+
+# This does NOT replace Gemini.
+OPENROUTER_MODEL = "openrouter/free"
+OPENROUTER_API_URL = (
+    "https://openrouter.ai/api/v1/chat/completions"
+)
 
 HISTORY_LIMIT = 20
 
@@ -50,12 +66,17 @@ MAX_CONCURRENT_AI_REQUESTS = 3
 PRIMARY_TIMEOUT_SECONDS = 8
 BACKUP_TIMEOUT_SECONDS = 6
 
+# OpenRouter gets a little longer because the free
+# router may need to select an available model.
+OPENROUTER_TIMEOUT_SECONDS = 25
+
 # For normal messages, Mia will not keep making
 # unsolicited AI replies every second in one channel.
 NORMAL_CHANNEL_REPLY_COOLDOWN = 8
 
 # If Gemini says quota/rate limit is exhausted,
-# stop hammering the API for a while.
+# stop hammering Gemini for a while.
+# OpenRouter can still answer during this period.
 QUOTA_BACKOFF_SECONDS = 60
 
 
@@ -632,6 +653,8 @@ def is_quota_error(error):
         "429" in error_text
         or "resource_exhausted" in error_text
         or "quota" in error_text
+        or "rate limit" in error_text
+        or "rate_limit" in error_text
     )
 
 
@@ -927,7 +950,155 @@ async def run_backup_model(
 
 
 # ==========================================
-# GEMINI RESPONSE
+# RUN OPENROUTER FALLBACK
+# ==========================================
+
+def run_openrouter_sync(
+    prompt,
+    image_data=None
+):
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError(
+            "OPENROUTER_API_KEY is not set."
+        )
+
+    if image_data is not None:
+        image_bytes, mime_type = image_data
+
+        image_base64 = base64.b64encode(
+            image_bytes
+        ).decode(
+            "utf-8"
+        )
+
+        user_content = [
+            {
+                "type": "text",
+                "text": prompt
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": (
+                        f"data:{mime_type};"
+                        f"base64,{image_base64}"
+                    )
+                }
+            }
+        ]
+    else:
+        user_content = prompt
+
+    response = requests.post(
+        OPENROUTER_API_URL,
+        headers={
+            "Authorization": (
+                f"Bearer {OPENROUTER_API_KEY}"
+            ),
+            "Content-Type": "application/json",
+            "X-Title": "Mia Discord Bot"
+        },
+        json={
+            "model": OPENROUTER_MODEL,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": user_content
+                }
+            ],
+            "max_tokens": 80
+        },
+        timeout=OPENROUTER_TIMEOUT_SECONDS
+    )
+
+    if not response.ok:
+        print(
+            "OpenRouter request failed:",
+            response.status_code,
+            response.text,
+            flush=True
+        )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    choices = data.get(
+        "choices",
+        []
+    )
+
+    if not choices:
+        raise RuntimeError(
+            "OpenRouter returned no choices."
+        )
+
+    message = choices[0].get(
+        "message",
+        {}
+    )
+
+    reply = message.get(
+        "content",
+        ""
+    )
+
+    if isinstance(
+        reply,
+        list
+    ):
+        text_parts = []
+
+        for part in reply:
+            if (
+                isinstance(part, dict)
+                and part.get("type") == "text"
+            ):
+                text = part.get(
+                    "text",
+                    ""
+                )
+
+                if text:
+                    text_parts.append(
+                        text
+                    )
+
+        reply = "".join(
+            text_parts
+        )
+
+    if not isinstance(
+        reply,
+        str
+    ):
+        reply = str(
+            reply
+        )
+
+    reply = reply.strip()
+
+    if not reply:
+        raise RuntimeError(
+            "OpenRouter returned an empty reply."
+        )
+
+    return reply
+
+
+async def run_openrouter_model(
+    prompt,
+    image_data=None
+):
+    return await asyncio.to_thread(
+        run_openrouter_sync,
+        prompt,
+        image_data
+    )
+
+
+# ==========================================
+# AI RESPONSE
 # ==========================================
 
 async def generate_mia_reply(
@@ -936,14 +1107,36 @@ async def generate_mia_reply(
 ):
     global gemini_quota_blocked_until
 
-    current_time = time.time()
-
-    if current_time < gemini_quota_blocked_until:
-        return None
-
     prompt = build_prompt(
         message
     )
+
+    # If Gemini is already in a temporary quota
+    # backoff, skip straight to OpenRouter.
+    if (
+        time.time()
+        < gemini_quota_blocked_until
+    ):
+        print(
+            "Gemini is in quota backoff. "
+            "Trying OpenRouter instead.",
+            flush=True
+        )
+
+        try:
+            return await run_openrouter_model(
+                prompt,
+                image_data=image_data
+            )
+
+        except Exception as error:
+            print(
+                f"OpenRouter fallback failed: "
+                f"{error}",
+                flush=True
+            )
+
+            return None
 
     contents = [
         types.Part.from_text(
@@ -963,6 +1156,13 @@ async def generate_mia_reply(
             )
         )
 
+    primary_quota_error = False
+    backup_quota_error = False
+
+    # ==========================================
+    # PRIMARY GEMINI
+    # ==========================================
+
     try:
         reply = await run_primary_model(
             contents
@@ -981,31 +1181,25 @@ async def generate_mia_reply(
         if is_quota_error(
             error
         ):
-            gemini_quota_blocked_until = (
-                time.time()
-                + QUOTA_BACKOFF_SECONDS
-            )
+            primary_quota_error = True
 
             print(
-                "Gemini quota is exhausted. "
-                "Mia is pausing AI requests "
-                f"for {QUOTA_BACKOFF_SECONDS} seconds.",
+                "Primary Gemini model hit quota. "
+                "Trying the backup Gemini model.",
                 flush=True
             )
 
-            # Do NOT try the backup model when this
-            # is a quota error. It would just waste
-            # another request against the same project.
-            return None
+        else:
+            print(
+                f"Primary Gemini model failed: "
+                f"{error}",
+                flush=True
+            )
 
-        print(
-            f"Primary Gemini model failed: "
-            f"{error}",
-            flush=True
-        )
+    # ==========================================
+    # BACKUP GEMINI
+    # ==========================================
 
-    # Only use backup for a normal model error/timeout,
-    # not for quota exhaustion.
     try:
         reply = await run_backup_model(
             contents
@@ -1024,22 +1218,61 @@ async def generate_mia_reply(
         if is_quota_error(
             error
         ):
-            gemini_quota_blocked_until = (
-                time.time()
-                + QUOTA_BACKOFF_SECONDS
-            )
+            backup_quota_error = True
 
             print(
-                "Gemini quota is exhausted. "
-                "Mia is pausing AI requests "
-                f"for {QUOTA_BACKOFF_SECONDS} seconds.",
+                "Backup Gemini model hit quota.",
                 flush=True
             )
 
-            return None
+        else:
+            print(
+                f"Backup Gemini model failed: "
+                f"{error}",
+                flush=True
+            )
+
+    # If either Gemini model reported quota exhaustion,
+    # pause Gemini requests for a while. OpenRouter still works.
+    if (
+        primary_quota_error
+        or backup_quota_error
+    ):
+        gemini_quota_blocked_until = (
+            time.time()
+            + QUOTA_BACKOFF_SECONDS
+        )
 
         print(
-            f"Backup Gemini model failed: "
+            "Gemini quota is exhausted. "
+            f"Skipping Gemini for "
+            f"{QUOTA_BACKOFF_SECONDS} seconds "
+            "and using OpenRouter during the backoff.",
+            flush=True
+        )
+
+    # ==========================================
+    # OPENROUTER FALLBACK
+    # ==========================================
+
+    try:
+        print(
+            f"Switching to OpenRouter fallback: "
+            f"{OPENROUTER_MODEL}",
+            flush=True
+        )
+
+        reply = await run_openrouter_model(
+            prompt,
+            image_data=image_data
+        )
+
+        if reply:
+            return reply.strip()
+
+    except Exception as error:
+        print(
+            f"OpenRouter fallback failed: "
             f"{error}",
             flush=True
         )
@@ -1188,15 +1421,9 @@ async def process_mia_message(message):
             ):
                 return
 
-        # ==========================================
-        # QUOTA BACKOFF
-        # ==========================================
-
-        if (
-            current_time
-            < gemini_quota_blocked_until
-        ):
-            return
+        # Do NOT stop processing when Gemini is
+        # in quota backoff. generate_mia_reply()
+        # will use OpenRouter instead.
 
         await maybe_react(
             message
@@ -1244,15 +1471,6 @@ async def process_mia_message(message):
         # ==========================================
 
         async with ai_request_semaphore:
-
-            # Check quota backoff again because
-            # another request may have hit 429
-            # while this one was waiting.
-            if (
-                time.time()
-                < gemini_quota_blocked_until
-            ):
-                return
 
             async with message.channel.typing():
                 reply = await generate_mia_reply(
@@ -1390,6 +1608,13 @@ async def on_ready():
     )
 
     print(
+        f"OpenRouter fallback: "
+        f"{OPENROUTER_MODEL} "
+        f"({'enabled' if OPENROUTER_API_KEY else 'API key not set'})",
+        flush=True
+    )
+
+    print(
         "Mia has separate conversation "
         "memory for every server/channel.",
         flush=True
@@ -1420,8 +1645,8 @@ async def on_ready():
     )
 
     print(
-        "Mia automatically backs off when "
-        "Gemini reports a quota limit.",
+        "When Gemini is out of quota, "
+        "Mia automatically uses OpenRouter.",
         flush=True
     )
 
